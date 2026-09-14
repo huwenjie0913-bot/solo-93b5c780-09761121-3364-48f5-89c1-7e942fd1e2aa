@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+coldchain.db
+coldchain.db-*
+.pytest_cache/
