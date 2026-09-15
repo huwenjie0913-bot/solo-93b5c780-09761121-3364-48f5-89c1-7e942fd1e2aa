@@ -7,6 +7,9 @@
 - peak_value：窗口内插值曲线的峰值温度；
 - degree_minutes：度·分钟，温度超出上限部分对时间的积分（℃·min）。
 
+线性段在区间内部穿越上限时，在解析交点处分段：超限时长与度·分钟都只
+统计实际超限的子区间（交点处余量为 0），不得按整段截断端点做梯形积分。
+
 规则：
 - 相邻采样间隔超过 max_gap_s 视为采样缺口，缺口内**不做线性补算**，
   窗口在缺口处切开，缺口部分计入 uncovered，结果标记不完整（incomplete）；
@@ -189,16 +192,26 @@ def envelope_exposure(
         above_lo = vlo > upper + _EPS
         above_hi = vhi > upper + _EPS
         if above_lo and above_hi:
+            xlo, xhi, vxlo, vxhi = lo, hi, vlo - upper, vhi - upper
             exceed_seconds += hi - lo
         elif above_lo or above_hi:
             span = vhi - vlo
             tc = lo + (upper - vlo) * (hi - lo) / span
-            exceed_seconds += (tc - lo) if above_lo else (hi - tc)
+            if above_lo:
+                # 升温/降温都只在阈值交点处分段，交点余量为 0
+                xlo, xhi, vxlo, vxhi = lo, tc, vlo - upper, 0.0
+                exceed_seconds += tc - lo
+            else:
+                xlo, xhi, vxlo, vxhi = tc, hi, 0.0, vhi - upper
+                exceed_seconds += hi - tc
+        else:
+            xlo = xhi = None
 
-        # 度·分钟：∫ max(0, v(t)-upper) dt / 60（梯形积分，线性即精确）
-        e_lo = max(0.0, vlo - upper)
-        e_hi = max(0.0, vhi - upper)
-        degree_minutes += (e_lo + e_hi) * 0.5 * (hi - lo) / 60.0
+        # 度·分钟：仅在实际超限子区间 [xlo,xhi) 上积分
+        # ∫ max(0, v(t)-upper) dt / 60；线性即梯形精确积分，
+        # 穿越阈值的半边余量在交点处为 0，不得按整段截断端点积分。
+        if xlo is not None:
+            degree_minutes += (vxlo + vxhi) * 0.5 * (xhi - xlo) / 60.0
 
     return {
         "exceed_seconds": exceed_seconds,

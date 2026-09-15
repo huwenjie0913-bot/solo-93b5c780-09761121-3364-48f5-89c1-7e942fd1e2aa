@@ -240,8 +240,8 @@ def test_exposure_trailing_ramp_uses_linear_interpolation(client):
     # 检测区段 [660,960]；驻留∩区段窗口 [660,960]；-16 平台至 900，900→960 线性穿越 -18 于 930
     assert res["exceed_seconds"] == pytest.approx(270.0)   # 660..930
     assert res["peak_value"] == -16.0
-    # 平台 240s*2/60=8 + 平台末段三角形 2*30/2/60=0.5 + 尾部三角形 2*30/2/60=0.5
-    assert res["degree_minutes"] == pytest.approx(9.0)
+    # 平台 240s*2/60=8 + 尾段跨阈值三角形 2*30/2/60=0.5
+    assert res["degree_minutes"] == pytest.approx(8.5)
 
 
 def test_exposure_with_stricter_profile_upper(client):
@@ -259,8 +259,77 @@ def test_exposure_with_stricter_profile_upper(client):
     res = compute(client, run["run_id"])["batches"][0]
     # -16 平台 660..900（240s 超 -17），900→960 线性穿越 -17 于 915
     assert res["exceed_seconds"] == pytest.approx(255.0)
-    # 240*1/60=4 + 平台末段三角形 1*15/2/60=0.125 + 尾部三角形 1*45/2/60=0.375
-    assert res["degree_minutes"] == pytest.approx(4.5)
+    # 240*1/60=4 + 尾段跨阈值三角形 1*15/2/60=0.125
+    assert res["degree_minutes"] == pytest.approx(4.125)
+
+
+def test_cooling_cross_threshold_triangle_and_over_limit(client):
+    """降温跨阈值：单个 60s 采样段内 -16→-20 线性穿越 -18，
+    超限子区间为交点之后的三角形：2℃*30s/2/60 = 0.5 度分钟。
+
+    回归缺陷：旧实现按整段截断端点（2+0)/2*60/60=1.0 积分，
+    限额 0.75 时会把实际未超限的批次误判为超限。
+    """
+    make_zone(client)
+    tv = bind(client, "ZA", ["P1"])
+    # 600..900 -16 平台，960 -20：检测区段 [600,960]，尾段降温跨阈值
+    pts = [(t, -16.0) for t in (600, 660, 720, 780, 840, 900)] + [(960, -20.0)]
+    post_temps(client, "P1", pts)
+    run = run_scoped(client, tv=tv["topology_version_id"], rule_id=make_rules(client))
+
+    make_profile(client, upper=-18.0, limit_dm=0.75)
+    make_batch(client)
+    # 驻留只覆盖含跨阈值尾段的窗口（夹掉 600 之前的平台），纯三角形
+    add_residency(client, "B1", 900, 1000)
+    res = compute(client, run["run_id"])["batches"][0]
+
+    # 交点在 930：超限 30s，三角形 0.5 度分钟，限额 0.75 不超限
+    assert res["exceed_seconds"] == pytest.approx(30.0)
+    assert res["degree_minutes"] == pytest.approx(0.5)
+    assert res["peak_value"] == -16.0
+    assert res["exposed"] is True
+    assert res["over_limit"] is False
+    d = res["details"][0]
+    assert (d["window"]["start_ts"] - T0, d["window"]["end_ts"] - T0) == (900, 960)
+    seg = d["segments"][0]
+    assert seg["degree_minutes"] == pytest.approx(0.5)
+
+
+def test_warming_cross_threshold_triangle(client):
+    """升温跨阈值：窗口内部的 -20→-16 上升段只计交点之前的三角形 0.5 度分钟。
+
+    构造同一评估窗口内两次越界（中间短暂恢复），使升温穿越落在窗口内部，
+    而非窗口左边界；旧实现会按整段 (0+2)/2*60/60=1.0 多算 0.5。
+    """
+    make_zone(client)
+    tv = bind(client, "ZA", ["P1"])
+    pts = [
+        (600, -16.0), (660, -16.0),     # 第一次越界
+        (720, -20.0),                   # 恢复（第一次越界结束）
+        (780, -16.0),                   # 升温跨阈值（720→780，交点 750），第二次越界开始
+        (840, -16.0), (900, -20.0),     # 平台后降温跨阈值（第二次越界结束于 870）
+    ]
+    post_temps(client, "P1", pts)
+    run = run_scoped(client, tv=tv["topology_version_id"], rule_id=make_rules(client))
+    assert len(client.get(f"/analysis/runs/{run['run_id']}/segments").json()) == 2
+
+    make_profile(client, upper=-18.0, limit_dm=100.0)
+    make_batch(client)
+    add_residency(client, "B1", 600, 1000)
+    res = compute(client, run["run_id"])["batches"][0]
+
+    # 第一次：660..720 平台 60s*2/60=2 + 降温三角形 0.5
+    # 升温三角形 0.5 + 第二次平台 60s*2/60=2 + 降温三角形 0.5
+    assert res["exceed_seconds"] == pytest.approx(210.0)   # 60+30+30+60+30
+    assert res["degree_minutes"] == pytest.approx(5.5)
+    assert res["peak_value"] == -16.0
+    assert res["over_limit"] is False
+    # 两个被恢复期隔开的区段在同一评估窗口内，缺口列表为空
+    segs = client.get(f"/analysis/runs/{run['run_id']}/segments").json()
+    d = res["details"][0]
+    assert d["uncovered_intervals"] == []
+    assert len(d["segments"]) == 2
+    assert {s["segment_id"] for s in d["segments"]} == {s["segment_id"] for s in segs}
 
 
 def test_sampling_gap_not_interpolated_and_marked_incomplete(client):
@@ -285,8 +354,8 @@ def test_sampling_gap_not_interpolated_and_marked_incomplete(client):
     assert gaps == [pytest.approx((120.0, 1200.0))]
     # 仅在覆盖段计暴露：区段1 120s 全 -16；区段2 至穿越点 1350（150s）
     assert res["exceed_seconds"] == pytest.approx(270.0)
-    # 区段1：120*2/60=4；区段2：120*2/60=4 + 两个三角形各 0.5
-    assert res["degree_minutes"] == pytest.approx(9.0)
+    # 区段1：120*2/60=4；区段2：平台 120*2/60=4 + 尾段跨阈值三角形 0.5
+    assert res["degree_minutes"] == pytest.approx(8.5)
     assert res["peak_value"] == -16.0
 
 
