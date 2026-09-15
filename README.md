@@ -5,6 +5,12 @@
 输出主因、置信等级与证据明细，明确标记**数据不足**与**证据冲突**。
 规则可版本化修改，按时间范围重算，保留历史分析版本，支持版本间结论 diff 与 JSON 报告导出。
 
+**库区设备拓扑**：同一站点多个库区共用上报通道时，可建立库区并绑定各自的
+探头/库门/压缩机；每次调整生成不可变拓扑版本并记录生效时段，设备归属重叠的绑定请求
+返回冲突区间且不写入。分析任务指定库区与拓扑版本后只读取本库区绑定设备的数据，
+相邻探头比较限定同区，范围内的未绑定数据仅作为告警列出、不参与打分；
+分析版本、区段、diff 与 JSON 报告均回显库区/拓扑版本与被排除数据摘要。
+
 技术栈：Python 3.11 · FastAPI · SQLite（标准库 sqlite3）· Pydantic v2
 
 ## 快速开始
@@ -42,14 +48,59 @@ POST /analysis/runs 按时间范围重算 ──▶ 越界区段识别 ──▶
 | POST | `/ingest/compressor-status` | 压缩机启停 `{"events":[{compressor_id, ts, state: on/off}]}` |
 | POST | `/ingest/defrost` | 化霜记录 `{"records":[{zone_id, start_ts, end_ts}]}` |
 | POST | `/rules` / GET `/rules` | 创建 / 查询规则集 |
-| POST | `/analysis/runs` | 按规则集+时间范围重算，生成新分析版本 |
+| POST | `/zones` · GET `/zones` · GET `/zones/{code}` | 创建 / 查询库区 |
+| POST | `/zones/{code}/topology-versions` | 调整绑定，生成不可变拓扑版本（重叠返回 409 冲突区间） |
+| GET | `/topology/versions` · `/topology/versions/{id}` | 拓扑版本（可按 zone 过滤）与版本快照 |
+| POST | `/analysis/runs` | 按规则集+时间范围（+库区/拓扑版本）重算，生成新分析版本 |
 | GET | `/analysis/runs` · `/analysis/runs/{id}` · `/analysis/runs/{id}/segments` | 版本与区段结论查询 |
-| GET | `/analysis/diff?run_a=&run_b=&tolerance_s=` | 两版本结论差异（新增/消失/主因或置信变化） |
-| GET | `/analysis/runs/{id}/report?download=true` | 导出 JSON 归因报告 |
+| GET | `/analysis/diff?run_a=&run_b=&tolerance_s=` | 两版本结论差异（回显双方库区/拓扑/排除摘要） |
+| GET | `/analysis/runs/{id}/report?download=true` | 导出 JSON 归因报告（含拓扑快照与排除数据告警） |
 
 - 时间戳同时接受 **Unix 秒** 与 **ISO 8601** 字符串；
 - 上报逐条校验，合法条目正常入库，非法条目在响应 `errors` 中逐条说明（部分接受）；
 - 温度采样按 `(probe_id, ts)` 去重，重复上报幂等。
+
+## 库区设备拓扑
+
+多个库区共用一套上报通道时，先建库区再绑定设备：
+
+```bash
+# 1. 建库区
+curl -X POST localhost:8000/zones -H 'Content-Type: application/json' \
+  -d '{"code":"ZA","name":"一号冷冻库"}'
+
+# 2. 绑定探头/库门/压缩机，生成不可变拓扑版本 v1
+curl -X POST localhost:8000/zones/ZA/topology-versions -H 'Content-Type: application/json' -d '{
+  "probes": ["P1", "P2"], "doors": ["D1"], "compressors": ["C1"],
+  "effective_from": "2026-09-14T00:00:00Z"
+}'
+
+# 3. 调整绑定 → 生成 v2，同时自动闭合 v1 的生效时段（快照不变）
+curl -X POST localhost:8000/zones/ZA/topology-versions -H 'Content-Type: application/json' \
+  -d '{"probes":["P1","P3"],"doors":["D1"],"compressors":["C1"],"note":"更换探头"}'
+```
+
+- 每次绑定是**全量快照**：版本一旦生成不可修改，仅新版本生效时闭合旧版本的 `effective_to`；
+- 设备在重叠时段只能归属一个库区。与**其它库区有效版本**冲突时返回 `409` 及逐条冲突区间
+  （对方版本、冲突开始时间、`conflict_end=null` 表示持续至今），**整笔请求不写入**；
+  已闭合且完全早于新生效时间的旧归属允许设备跨区流转；
+- 同库区重复绑定同一设备按去重处理；绑定设备全部为空返回 422。
+
+创建分析任务时指定库区与拓扑版本（缺省取该库区最新版本）：
+
+```bash
+curl -X POST localhost:8000/analysis/runs -H 'Content-Type: application/json' -d '{
+  "rule_set_id": 1,
+  "range_start": 1789340000, "range_end": 1789350000,
+  "zone": "ZA", "topology_version_id": 1
+}'
+```
+
+- 温度区段只识别本库区绑定探头；开门/压缩机/化霜证据只来自绑定设备，相邻探头比较限定同区；
+- 分析范围内的**未绑定数据**（含属于其它库区的设备）不参与打分，单独落库为
+  `excluded_alerts`，响应、详情与报告中的 `excluded_summary` 给出按类型计数；
+- 分析版本固化 `zone_id` / `topology_version_id`；不传 `zone` 的旧版任务仍按全量数据复现；
+- 旧 SQLite 库启动时自动迁移（`PRAGMA user_version`），历史数据绑定后即可参与区分分析。
 
 ## 区段识别规则（RuleConfig）
 
@@ -110,10 +161,12 @@ curl -OJ "localhost:8000/analysis/runs/2/report?download=true"
 coldchain/
 ├── main.py         # FastAPI 路由
 ├── schemas.py      # 字段校验与规则配置（Pydantic）
-├── db.py           # SQLite 建表与连接
+├── db.py           # SQLite 建表、迁移与连接
+├── topology.py     # 库区、不可变拓扑版本与设备绑定（冲突区间检测）
 ├── detection.py    # 越界区段识别（上限/持续时长/采样缺口）
 ├── timeline.py     # 事件时间线对齐（开门配对/占空比/斜率/恢复时间）
 ├── attribution.py  # 证据打分归因引擎
-└── analysis.py     # 分析版本、diff、报告导出
-tests/test_api.py   # 10 个端到端场景测试
+└── analysis.py     # 分析版本、库区隔离、排除告警、diff、报告导出
+tests/test_api.py            # 10 个端到端场景测试
+tests/test_topology_api.py   # 8 个库区拓扑/迁移/复现场景测试
 ```

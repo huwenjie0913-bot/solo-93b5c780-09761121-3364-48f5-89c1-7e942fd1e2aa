@@ -110,9 +110,49 @@ class RunRequest(BaseModel):
     rule_set_id: Optional[int] = Field(default=None, description="缺省使用最新规则集")
     range_start: Ts
     range_end: Ts
+    zone: Optional[str] = Field(
+        default=None, description="库区编码（或数字 ID）；指定后只分析该库区绑定设备"
+    )
+    topology_version_id: Optional[int] = Field(
+        default=None, description="拓扑版本 ID；缺省使用该库区最新版本"
+    )
 
     @model_validator(mode="after")
     def _check_range(self):
         if self.range_end <= self.range_start:
             raise ValueError("range_end 必须大于 range_start")
+        if self.topology_version_id is not None and not self.zone:
+            raise ValueError("指定 topology_version_id 时必须同时指定 zone")
+        return self
+
+
+# ---------------------------------------------------------------- 库区拓扑
+
+class ZoneCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64, description="库区编码，唯一")
+    name: str = Field(min_length=1, max_length=128)
+
+
+class TopologyVersionCreate(BaseModel):
+    """为库区生成不可变拓扑版本；绑定设备全量替换（新版本快照）。"""
+
+    probes: list[str] = Field(default_factory=list)
+    doors: list[str] = Field(default_factory=list)
+    compressors: list[str] = Field(default_factory=list)
+    effective_from: Optional[Ts] = Field(
+        default=None, description="生效时间；缺省为当前时间"
+    )
+    note: Optional[str] = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def _check_nonempty(self):
+        if not (self.probes or self.doors or self.compressors):
+            raise ValueError("拓扑版本至少需要绑定一个设备（探头/库门/压缩机）")
+        for label, ids in (
+            ("probes", self.probes),
+            ("doors", self.doors),
+            ("compressors", self.compressors),
+        ):
+            if any(not isinstance(x, str) or not (1 <= len(x) <= 64) for x in ids):
+                raise ValueError(f"{label} 中的设备 ID 长度需在 1~64 之间")
         return self

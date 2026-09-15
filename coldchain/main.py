@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from . import __version__, analysis, db
+from . import __version__, analysis, db, topology
 from .schemas import (
     CompressorStatusIn,
     DefrostRecordIn,
@@ -19,6 +19,8 @@ from .schemas import (
     RuleSetCreate,
     RunRequest,
     TempSampleIn,
+    TopologyVersionCreate,
+    ZoneCreate,
 )
 
 
@@ -146,15 +148,100 @@ def list_rule_sets():
         conn.close()
 
 
+# ---------------------------------------------------------------- 库区设备拓扑
+
+@app.post("/zones", status_code=201)
+def create_zone(payload: ZoneCreate):
+    """创建库区。"""
+    try:
+        return topology.create_zone(payload.code, payload.name)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/zones")
+def list_zones():
+    return topology.list_zones()
+
+
+@app.get("/zones/{code}")
+def get_zone(code: str):
+    try:
+        return topology.get_zone(code)
+    except topology.ZoneNotFound as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/zones/{code}/topology-versions", status_code=201)
+def bind_topology(code: str, payload: TopologyVersionCreate):
+    """调整库区内探头/库门/压缩机绑定，生成不可变拓扑版本。
+
+    设备归属与其它库区的有效绑定在时间上重叠时返回 409 与冲突区间，整笔不写入。
+    """
+    try:
+        return topology.create_topology_version(
+            code,
+            probes=payload.probes,
+            doors=payload.doors,
+            compressors=payload.compressors,
+            effective_from=payload.effective_from,
+            note=payload.note,
+        )
+    except topology.ZoneNotFound as e:
+        raise HTTPException(404, str(e))
+    except topology.TopologyConflict as e:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "设备归属重叠",
+                "message": "一个设备在重叠时段只能归属一个库区",
+                "conflicts": e.conflicts,
+            },
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/topology/versions")
+def list_topology_versions(zone: Optional[str] = Query(default=None)):
+    try:
+        return topology.list_versions(zone)
+    except topology.ZoneNotFound as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/topology/versions/{version_id}")
+def get_topology_version(version_id: int):
+    try:
+        return topology.get_version(version_id)
+    except topology.TopologyVersionNotFound as e:
+        raise HTTPException(404, str(e))
+
+
 # ---------------------------------------------------------------- 分析版本
 
 @app.post("/analysis/runs", status_code=201)
 def create_run(req: RunRequest):
-    """按规则集在指定时间范围内重算，生成新的分析版本。"""
+    """按规则集在指定时间范围内重算，生成新的分析版本。
+
+    指定 zone（与 topology_version_id）后只读取该库区绑定设备的数据，
+    范围内未绑定数据作为排除告警单独记录，不参与打分。
+    """
     try:
-        return analysis.run_analysis(req.rule_set_id, req.range_start, req.range_end)
+        return analysis.run_analysis(
+            req.rule_set_id,
+            req.range_start,
+            req.range_end,
+            zone=req.zone,
+            topology_version_id=req.topology_version_id,
+        )
     except KeyError as e:
         raise HTTPException(404, str(e))
+    except topology.TopologyVersionNotFound as e:
+        raise HTTPException(404, str(e))
+    except topology.TopologyConflict as e:
+        raise HTTPException(409, detail={"error": "拓扑版本与库区不匹配",
+                                         "conflicts": e.conflicts})
 
 
 @app.get("/analysis/runs")
