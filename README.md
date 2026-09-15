@@ -5,6 +5,14 @@
 输出主因、置信等级与证据明细，明确标记**数据不足**与**证据冲突**。
 规则可版本化修改，按时间范围重算，保留历史分析版本，支持版本间结论 diff 与 JSON 报告导出。
 
+**批次暴露核算**：产品温控档案（温度上限 + 累计暴露限额）按不可变版本管理，
+批次登记时固化当前档案版本；写入批次在各库区的驻留时段（同一批次重叠驻留
+返回 409 冲突区间）。核算时按库区与时间交集把批次关联到已完成的分析区段，
+在“驻留∩区段”窗口上对探头采样做**分段线性插值**，得到超限时长、峰值与
+度·分钟；相邻样本间隔超过规则缺口阈值时不跨缺口补算，缺口部分列为未覆盖
+并标记结果不完整。单批次与分析运行级均可查询，每次核算固化档案版本、
+旧结果可复现，分析 JSON 报告汇总受影响批次。
+
 **库区设备拓扑**：同一站点多个库区共用上报通道时，可建立库区并绑定各自的
 探头/库门/压缩机；每次调整生成不可变拓扑版本并记录生效时段，设备归属重叠的绑定请求
 返回冲突区间且不写入。分析任务指定库区与拓扑版本后只读取本库区绑定设备的数据，
@@ -37,6 +45,12 @@ POST /analysis/runs 按时间范围重算 ──▶ 越界区段识别 ──▶
         │
         ▼
 版本保留 ──▶ /analysis/diff 结论对比 ──▶ /analysis/runs/{id}/report 导出 JSON
+        │
+        ▼
+产品档案/批次驻留 ──▶ POST /exposure/runs 关联区段并线性插值核算暴露
+        │
+        ▼
+单批次/运行级查询（固化档案版本，旧结果可复现）· 报告汇总受影响批次
 ```
 
 ## API 一览
@@ -54,7 +68,13 @@ POST /analysis/runs 按时间范围重算 ──▶ 越界区段识别 ──▶
 | POST | `/analysis/runs` | 按规则集+时间范围（+库区/拓扑版本）重算，生成新分析版本 |
 | GET | `/analysis/runs` · `/analysis/runs/{id}` · `/analysis/runs/{id}/segments` | 版本与区段结论查询 |
 | GET | `/analysis/diff?run_a=&run_b=&tolerance_s=` | 两版本结论差异（回显双方库区/拓扑/排除摘要） |
-| GET | `/analysis/runs/{id}/report?download=true` | 导出 JSON 归因报告（含拓扑快照与排除数据告警） |
+| GET | `/analysis/runs/{id}/report?download=true` | 导出 JSON 归因报告（含拓扑快照、排除数据告警、受影响批次摘要） |
+| POST | `/products/profiles` · GET `/products/profiles` · `/products/profiles/{id}` | 产品温控档案版本（温度上限/累计暴露限额） |
+| POST | `/batches` · GET `/batches` · GET `/batches/{no}` | 批次登记（固化当前档案版本）与驻留查询 |
+| POST | `/batches/{no}/residencies` | 写入批次驻留时段（同批次重叠返回 409 冲突区间） |
+| POST | `/exposure/runs` | 对已完成分析版本固化批次暴露核算（可单批次/指定档案版本） |
+| GET | `/exposure/runs` · `/exposure/runs/{id}` | 核算版本列表（可按分析版本过滤）与完整结果 |
+| GET | `/batches/{no}/exposure` | 单批次暴露结果（可按分析版本/核算版本过滤） |
 
 - 时间戳同时接受 **Unix 秒** 与 **ISO 8601** 字符串；
 - 上报逐条校验，合法条目正常入库，非法条目在响应 `errors` 中逐条说明（部分接受）；
@@ -134,6 +154,77 @@ curl -X POST localhost:8000/analysis/runs -H 'Content-Type: application/json' -d
 - **证据冲突**（`conflicting_evidence`）：前两名候选主因得分接近（如开门后长期不恢复且压缩机满载）；
 - 无任何有效证据时主因为 `unknown`。
 
+## 批次暴露核算
+
+一次越界只可能影响“当时在库”的批次。按以下流程核算**哪些货品受影响、暴露有多重**：
+
+```
+产品档案(版本化: 上限+限额) ─┐
+批次登记(固化档案版本)       ├─▶ 驻留时段(重叠拒绝) ─▶ 已完成分析版本(库区+范围)
+                            │                              │
+                            └──────────────▶ 库区/时间交集关联越界区段
+                                                │
+                            探头采样线性插值（缺口不跨补，标 incomplete）
+                                                ▼
+                  超限时长 exceed_seconds / 峰值 peak_value / 度·分钟 degree_minutes
+                                                ▼
+                  over_limit（度·分钟 > 档案限额）· 主因 · 置信 · 明细（可复现）
+```
+
+### 产品档案与批次
+
+```bash
+# 1. 温控档案：每次 POST 生成一个不可变新版本（版本号产品内递增）
+curl -X POST localhost:8000/products/profiles -H 'Content-Type: application/json' -d '{
+  "product_code": "DUM", "name": "速冻饺子",
+  "temp_upper": -18.0, "exposure_limit_dm": 20.0
+}'
+# 2. 登记批次：固化登记时的最新档案版本（后续新档案不影响在途批次）
+curl -X POST localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"batch_no":"B2026091401","product_code":"DUM"}'
+# 3. 写入驻留时段（半开区间 [start,end)，可一次多条）
+curl -X POST localhost:8000/batches/B2026091401/residencies -H 'Content-Type: application/json' -d '{
+  "residencies": [
+    {"zone":"ZA","start_ts":"2026-09-14T08:00:00Z","end_ts":"2026-09-14T10:00:00Z"}
+  ]}'
+```
+
+- 档案字段：`temp_upper`（温度上限 ℃，严格高于此值才计暴露）、
+  `exposure_limit_dm`（累计暴露限额，单位**度·分钟**，即温度超出上限部分对时间的积分）；
+- 同一批次的驻留时段只要有正长度时间重叠（**即使分处不同库区**、或同一次请求内部），
+  返回 `409` 与逐条冲突区间（`conflict_start/conflict_end`、`other_residency_id`），
+  **整笔请求不写入**；仅端点相接（`[a,b)`+`[b,c)`）允许。
+
+### 核算与查询
+
+```bash
+# 针对已完成且指定库区的分析版本固化一次核算（默认覆盖范围内所有在库批次）
+curl -X POST localhost:8000/exposure/runs -H 'Content-Type: application/json' \
+  -d '{"analysis_run_id": 3}'
+# 只算一个批次；也可用 profile_id / profile_version 指定档案版本（必须属于该批次产品）
+curl -X POST localhost:8000/exposure/runs -H 'Content-Type: application/json' \
+  -d '{"analysis_run_id": 3, "batch_no":"B2026091401", "profile_version": 1}'
+# 单批次查询（缺省取最近一次核算；可按 analysis_run_id / exposure_run_id 过滤）
+curl "localhost:8000/batches/B2026091401/exposure?analysis_run_id=3"
+```
+
+- **关联**：批次驻留按 `库区一致 AND 时间正长度相交` 关联到该分析版本的越界区段；
+  同一驻留下按（探头）归组，评估窗口为驻留与“该探头关联区段包络”的交集；
+- **插值与积分**：相邻采样间做分段线性插值，线性穿越上限时解析求根/积分
+  （度·分钟按梯形精确积分）；多探头同步越界时按时间轴取**温度上包络**，
+  同一时刻不因多探头重复计度；
+- **采样缺口**：相邻样本间隔超过规则集 `max_gap_s` 时**不跨缺口补算**，
+  缺口（及窗口两侧无样本覆盖部分）列入 `uncovered_intervals`，明细与批次结果
+  标记 `incomplete=true`，超限时长/度·分钟只反映可覆盖部分；
+- **结果字段**：`exceed_seconds`、`peak_value`、`degree_minutes`、`exposure_limit_dm`、
+  `exposed`（是否有超限时间）、`over_limit`（度·分钟是否超档案限额）、
+  `incomplete`、`primary_cause`/`confidence`（取自关联区段、按暴露时长加权主因，
+  置信取贡献暴露区段的最低档）、`details[]`（逐驻留/探头窗口与逐区段暴露明细）；
+- **固化复现**：每次核算把所用档案版本（含 `temp_upper`/限额快照）与全部明细
+  存入核算版本；之后即使档案更新、数据补报，旧核算结果不变。分析 JSON 报告
+  `batch_exposure` 块汇总最近一次核算的受影响批次（未核算时给 `available=false` 空摘要）；
+- 未指定库区的分析版本无法关联批次，对其发起核算返回 422。
+
 ## 示例
 
 ```bash
@@ -159,14 +250,18 @@ curl -OJ "localhost:8000/analysis/runs/2/report?download=true"
 
 ```
 coldchain/
-├── main.py         # FastAPI 路由
+├── main.py          # FastAPI 路由
 ├── schemas.py      # 字段校验与规则配置（Pydantic）
 ├── db.py           # SQLite 建表、迁移与连接
 ├── topology.py     # 库区、不可变拓扑版本与设备绑定（冲突区间检测）
 ├── detection.py    # 越界区段识别（上限/持续时长/采样缺口）
 ├── timeline.py     # 事件时间线对齐（开门配对/占空比/斜率/恢复时间）
 ├── attribution.py  # 证据打分归因引擎
+├── products.py     # 产品温控档案版本、批次与驻留时段（重叠冲突）
+├── exposurecalc.py # 暴露数值引擎（线性插值/缺口覆盖/多探头上包络积分）
+├── exposure.py     # 批次暴露核算编排、固化复现、查询与报告摘要
 └── analysis.py     # 分析版本、库区隔离、排除告警、diff、报告导出
 tests/test_api.py            # 10 个端到端场景测试
 tests/test_topology_api.py   # 8 个库区拓扑/迁移/复现场景测试
+tests/test_exposure_api.py   # 13 个批次暴露核算场景测试
 ```

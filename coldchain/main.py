@@ -11,11 +11,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from . import __version__, analysis, db, topology
+from . import __version__, analysis, db, exposure, products, topology
 from .schemas import (
+    BatchCreate,
     CompressorStatusIn,
     DefrostRecordIn,
     DoorEventIn,
+    ExposureRunRequest,
+    ProfileCreate,
+    ResidenciesCreate,
     RuleSetCreate,
     RunRequest,
     TempSampleIn,
@@ -218,6 +222,77 @@ def get_topology_version(version_id: int):
         raise HTTPException(404, str(e))
 
 
+# ---------------------------------------------------------------- 产品档案 / 批次驻留
+
+@app.post("/products/profiles", status_code=201)
+def create_profile(payload: ProfileCreate):
+    """创建产品温控档案的一个不可变版本（温度上限 + 累计暴露限额）。"""
+    return products.create_profile(
+        payload.product_code,
+        payload.name,
+        payload.temp_upper,
+        payload.exposure_limit_dm,
+        note=payload.note,
+    )
+
+
+@app.get("/products/profiles")
+def list_profiles(product_code: Optional[str] = Query(default=None)):
+    return products.list_profiles(product_code)
+
+
+@app.get("/products/profiles/{profile_id}")
+def get_profile(profile_id: int):
+    try:
+        return products.get_profile(profile_id)
+    except products.ProfileNotFound as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/batches", status_code=201)
+def create_batch(payload: BatchCreate):
+    """登记批次并绑定产品当前（最新）温控档案版本。"""
+    try:
+        return products.create_batch(payload.batch_no, payload.product_code)
+    except products.ProfileNotFound as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/batches")
+def list_batches():
+    return products.list_batches()
+
+
+@app.get("/batches/{batch_no}")
+def get_batch(batch_no: str):
+    try:
+        return products.get_batch(batch_no)
+    except products.BatchNotFound as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/batches/{batch_no}/residencies", status_code=201)
+def add_residencies(batch_no: str, payload: ResidenciesCreate):
+    """写入批次驻留时段；同一批次时间重叠（含同批请求内部）返回 409 冲突区间，整笔不写入。"""
+    try:
+        return products.add_residencies(batch_no, payload.residencies)
+    except products.BatchNotFound as e:
+        raise HTTPException(404, str(e))
+    except topology.ZoneNotFound as e:
+        raise HTTPException(404, str(e))
+    except products.ResidencyConflict as e:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "批次驻留时段重叠",
+                "message": "同一批次的驻留时段不得时间重叠",
+                "conflicts": e.conflicts,
+            },
+        )
+
+
 # ---------------------------------------------------------------- 分析版本
 
 @app.post("/analysis/runs", status_code=201)
@@ -291,3 +366,55 @@ def get_report(run_id: int, download: bool = Query(default=False)):
             f'attachment; filename="coldchain_report_run{run_id}.json"'
         )
     return JSONResponse(report, headers=headers)
+
+
+# ---------------------------------------------------------------- 批次暴露核算
+
+@app.post("/exposure/runs", status_code=201)
+def create_exposure_run(req: ExposureRunRequest):
+    """针对已完成分析版本固化一次批次暴露核算（档案版本随结果固化，可复现）。"""
+    try:
+        return exposure.compute_exposure(
+            req.analysis_run_id,
+            batch_no=req.batch_no,
+            profile_id=req.profile_id,
+            profile_version=req.profile_version,
+        )
+    except (products.BatchNotFound, products.ProfileNotFound) as e:
+        raise HTTPException(404, str(e))
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/exposure/runs")
+def list_exposure_runs(analysis_run_id: Optional[int] = Query(default=None)):
+    return exposure.list_exposure_runs(analysis_run_id)
+
+
+@app.get("/exposure/runs/{exposure_run_id}")
+def get_exposure_run(exposure_run_id: int):
+    try:
+        return exposure.get_exposure_run(exposure_run_id)
+    except exposure.ExposureRunNotFound as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/batches/{batch_no}/exposure")
+def get_batch_exposure(
+    batch_no: str,
+    analysis_run_id: Optional[int] = Query(default=None),
+    exposure_run_id: Optional[int] = Query(default=None),
+):
+    """单批次暴露核算结果（关联区段、主因、置信、暴露明细、是否超限）。"""
+    try:
+        return exposure.get_batch_exposure(
+            batch_no,
+            analysis_run_id=analysis_run_id,
+            exposure_run_id=exposure_run_id,
+        )
+    except products.BatchNotFound as e:
+        raise HTTPException(404, str(e))
+    except exposure.ExposureResultNotFound as e:
+        raise HTTPException(404, str(e))

@@ -156,3 +156,65 @@ class TopologyVersionCreate(BaseModel):
             if any(not isinstance(x, str) or not (1 <= len(x) <= 64) for x in ids):
                 raise ValueError(f"{label} 中的设备 ID 长度需在 1~64 之间")
         return self
+
+
+# ---------------------------------------------------------------- 批次暴露核算
+
+class ProfileCreate(BaseModel):
+    """产品温控档案（创建即生成一个不可变版本）。
+
+    temp_upper 为该产品的温度上限 ℃；超过此温度的时间才计入暴露。
+    exposure_limit_dm 为累计暴露限额（度·分钟，温度超出上限的时间积分）。
+    """
+
+    product_code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+    temp_upper: float = Field(ge=-80.0, le=80.0, description="温度上限 ℃")
+    exposure_limit_dm: float = Field(
+        gt=0.0, description="累计暴露限额（度·分钟，超限部分的时间积分）"
+    )
+    note: Optional[str] = Field(default=None, max_length=256)
+
+
+class BatchCreate(BaseModel):
+    batch_no: str = Field(min_length=1, max_length=64)
+    product_code: str = Field(min_length=1, max_length=64)
+
+
+class ResidencyIn(BaseModel):
+    """批次在某库区的驻留时段（半开区间 [start_ts, end_ts)）。"""
+
+    zone: str = Field(min_length=1, max_length=64, description="库区编码（或数字 ID）")
+    start_ts: Ts
+    end_ts: Ts
+
+    @model_validator(mode="after")
+    def _check_order(self):
+        if self.end_ts <= self.start_ts:
+            raise ValueError("驻留结束时间必须大于开始时间")
+        return self
+
+
+class ResidenciesCreate(BaseModel):
+    residencies: list[ResidencyIn] = Field(min_length=1)
+
+
+class ExposureRunRequest(BaseModel):
+    """针对已完成分析版本固化一次批次暴露核算。
+
+    - analysis_run_id：已完成的分析运行（须指定库区），批次按其库区与时间交集关联；
+    - batch_no：仅核算单个批次；缺省核算时间窗口覆盖该分析范围的全部在库批次；
+    - profile_id / profile_version：覆盖批次默认档案（必须属于该批次产品），
+      其余批次仍使用各自当前档案版本；每次核算固化档案版本，结果可复现。
+    """
+
+    analysis_run_id: int
+    batch_no: Optional[str] = Field(default=None, max_length=64)
+    profile_id: Optional[int] = None
+    profile_version: Optional[int] = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _check_profile_selectors(self):
+        if self.profile_id is not None and self.profile_version is not None:
+            raise ValueError("profile_id 与 profile_version 只能指定其一")
+        return self

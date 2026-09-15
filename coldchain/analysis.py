@@ -763,4 +763,23 @@ def build_report(run_id: int) -> Dict:
             "summary": _excluded_summary(excluded),
             "alerts": excluded,
         }
+        # 批次暴露核算摘要：取该分析版本最近一次固化的核算（可能尚未核算）
+        from . import exposure as _exposure
+
+        conn2 = db.connect()
+        try:
+            report["batch_exposure"] = _exposure.report_block(conn2, run_id)
+        finally:
+            conn2.close()
+    else:
+        # 未指定库区的分析无法关联批次，显式给出空摘要保持报告结构稳定
+        report["batch_exposure"] = {
+            "available": False,
+            "latest_exposure_run_id": None,
+            "batch_count": 0,
+            "affected_count": 0,
+            "over_limit_count": 0,
+            "incomplete_count": 0,
+            "affected_batches": [],
+        }
     return report

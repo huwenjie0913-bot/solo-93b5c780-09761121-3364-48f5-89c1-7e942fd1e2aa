@@ -468,11 +468,13 @@ def test_legacy_db_migrates_and_historical_data_analyzable(tmp_path, monkeypatch
         conn = sqlite3.connect(db_path)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(analysis_runs)")}
         assert {"zone_id", "topology_version_id"} <= cols
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"zones", "topology_versions", "topology_bindings",
-                "run_excluded_data"} <= tables
+                "run_excluded_data", "product_profiles", "batches",
+                "batch_residencies", "exposure_runs",
+                "exposure_batch_results"} <= tables
         assert conn.execute("SELECT COUNT(*) FROM temp_samples").fetchone()[0] == 7
         conn.close()
 
