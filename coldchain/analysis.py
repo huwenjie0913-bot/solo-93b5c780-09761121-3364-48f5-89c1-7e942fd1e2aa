@@ -328,7 +328,15 @@ def run_analysis(
             for r in conn.execute(defrost_sql, defrost_params)
         ]
 
-        if bound["probe"]:
+        if topo is None:
+            probes = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT probe_id FROM temp_samples WHERE ts BETWEEN ? AND ?",
+                    (range_start, range_end),
+                )
+            ]
+        elif bound["probe"]:
             ph = ",".join("?" for _ in bound["probe"])
             probes = [
                 r[0]
@@ -342,13 +350,9 @@ def run_analysis(
             order = {p: i for i, p in enumerate(bound["probe"])}
             probes.sort(key=lambda p: order[p])
         else:
-            probes = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT DISTINCT probe_id FROM temp_samples WHERE ts BETWEEN ? AND ?",
-                    (range_start, range_end),
-                )
-            ]
+            # 合法的空探头拓扑（只绑门/压缩机）：保持为空，
+            # 任何未绑定探头都只能进入排除告警，不得产生区段或参与打分
+            probes = []
 
         n_segments = 0
         for probe in probes:

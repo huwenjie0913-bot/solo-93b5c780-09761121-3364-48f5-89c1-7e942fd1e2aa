@@ -344,6 +344,67 @@ def test_report_diff_echo_zone_topology_and_pinned_reproducibility(client):
     assert diff["summary"]["only_in_run_b"] >= 1  # P9 新区段
 
 
+def test_empty_probe_binding_keeps_probes_empty(client):
+    """合法拓扑：只绑库门/压缩机、不绑探头。
+
+    空探头绑定必须保持为空——未绑定探头只进排除告警，
+    不得产生区段，也不得（作为相邻探头）参与打分。
+    """
+    make_zone(client, "ZA", "A库")
+    make_zone(client, "ZB", "B库")
+    tv = bind(client, "ZA", doors=["D1"], compressors=["C1"], effective_from=T0)
+    assert tv["bindings"]["probe"] == []
+    bind(client, "ZB", probes=["P3"], effective_from=T0)
+
+    spike = [(t, -20.0) for t in range(0, 600, 60)]
+    spike += [(t, -10.0) for t in range(600, 1560, 60)]
+    spike += [(1560, -20.0)]
+    post_temps(client, "P1", spike)  # 未绑定：越界，只能告警
+    post_temps(client, "P2", [(t, -20.0) for t in range(0, 1680, 60)])  # 未绑定：正常
+    post_temps(client, "P3", spike)  # 属于其它库区
+    post_doors(client, "D1", [(600, "open"), (900, "closed")])
+    post_compressor(client, "C1", [(0, "on")])
+
+    run = run_scoped(client, "ZA", tv=tv["topology_version_id"], rule_id=make_rules(client))
+    assert run["segment_count"] == 0
+    assert run["probe_count"] == 0
+    # 区段查询为空：未绑定探头未被分析
+    assert client.get(f"/analysis/runs/{run['run_id']}/segments").json() == []
+
+    detail = client.get(f"/analysis/runs/{run['run_id']}").json()
+    alerts = {(a["kind"], a["device_id"]): a for a in detail["excluded_alerts"]}
+    # 所有未绑定探头（含越界的 P1、其它库区的 P3）都只列入告警
+    assert set(alerts) == {
+        ("temperature", "P1"),
+        ("temperature", "P2"),
+        ("temperature", "P3"),
+    }
+    assert alerts[("temperature", "P3")]["bound_elsewhere"] is True
+    assert alerts[("temperature", "P1")]["bound_elsewhere"] is False
+    # 已绑定的门/压缩机不算排除数据
+    assert detail["excluded_summary"]["by_kind"] == {"temperature": 3}
+
+    # 报告同样不含区段，但完整回显排除告警与拓扑
+    report = client.get(f"/analysis/runs/{run['run_id']}/report").json()
+    assert report["segments"] == []
+    assert report["topology"]["bindings"]["probe"] == []
+    assert report["excluded_data"]["summary"]["by_kind"]["temperature"] == 3
+
+    # 空探头拓扑随后补绑探头：历史温度数据即可参与区段识别
+    tv2 = bind(client, "ZA", probes=["P1", "P2"], doors=["D1"],
+               compressors=["C1"], effective_from=T0 + 4000)
+    run2 = run_scoped(client, "ZA", tv=tv2["topology_version_id"])
+    segs = segments(client, run2["run_id"], "P1")
+    assert len(segs) == 1  # 此前空探头拓扑下为 0 个区段
+    assert run2["probe_count"] == 2
+    # 新拓扑下 P1/P2 已绑定，不再出现在排除告警
+    detail2 = client.get(f"/analysis/runs/{run2['run_id']}").json()
+    excluded_probes = {
+        a["device_id"] for a in detail2["excluded_alerts"] if a["kind"] == "temperature"
+    }
+    assert excluded_probes == {"P3"}
+
+
 def test_scoped_run_validation(client):
     make_rules(client)
     make_zone(client, "ZA", "A库")
